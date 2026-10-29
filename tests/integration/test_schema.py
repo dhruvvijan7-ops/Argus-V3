@@ -1,0 +1,112 @@
+"""Start-up never runs against a schema that does not match the code."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+from sqlalchemy import inspect
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from argus.common.errors import StorageError
+from argus.config.settings import StorageSettings
+from argus.storage import migrate
+from argus.storage.database import Database
+
+POSTGRES_URL = os.environ.get("ARGUS_TEST_POSTGRES_URL")
+
+
+async def columns(url: str, table: str) -> set[str]:
+    engine = create_async_engine(url)
+    try:
+        async with engine.connect() as connection:
+            return {
+                column["name"]
+                for column in await connection.run_sync(
+                    lambda sync: inspect(sync).get_columns(table)
+                )
+            }
+    finally:
+        await engine.dispose()
+
+
+async def test_existing_sqlite_database_is_upgraded_on_start(tmp_path: Path) -> None:
+    # A database made by an earlier release: the initial schema, then stamped nothing.
+    url = f"sqlite+aiosqlite:///{tmp_path / 'old.db'}"
+    await migrate.upgrade(url, migrate.INITIAL_REVISION)
+    assert "replay_id" not in await columns(url, "response_actions")
+
+    database = Database(StorageSettings(database_url=url))
+    await database.connect()
+    await database.close()
+    assert "replay_id" in await columns(url, "response_actions")
+    assert await migrate.current_revision(url) == migrate.head_revision()
+
+
+async def test_pre_migration_sqlite_file_is_stamped_then_upgraded(tmp_path: Path) -> None:
+    # Files created with create_all before migrations existed have tables but no
+    # alembic_version; upgrading must not try to create those tables again.
+    url = f"sqlite+aiosqlite:///{tmp_path / 'legacy.db'}"
+    await migrate.upgrade(url, migrate.INITIAL_REVISION)
+    engine = create_async_engine(url)
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql("DROP TABLE alembic_version")
+    await engine.dispose()
+
+    database = Database(StorageSettings(database_url=url))
+    await database.connect()
+    await database.close()
+    assert await migrate.current_revision(url) == migrate.head_revision()
+
+
+@pytest.mark.skipif(not POSTGRES_URL, reason="ARGUS_TEST_POSTGRES_URL not set")
+async def test_outdated_postgresql_schema_is_refused() -> None:
+    assert POSTGRES_URL
+    from sqlalchemy.ext.asyncio import create_async_engine as engine_for
+
+    admin = engine_for(
+        POSTGRES_URL.replace("postgresql://", "postgresql+asyncpg://"), isolation_level="AUTOCOMMIT"
+    )
+    async with admin.connect() as connection:
+        await connection.exec_driver_sql("DROP DATABASE IF EXISTS sx_schema_test")
+        await connection.exec_driver_sql("CREATE DATABASE sx_schema_test")
+    url = POSTGRES_URL.rsplit("/", 1)[0] + "/sx_schema_test"
+    try:
+        await migrate.upgrade(url, migrate.INITIAL_REVISION)
+        database = Database(StorageSettings(database_url=url))
+        with pytest.raises(StorageError, match="argus db upgrade"):
+            await database.connect()
+        await migrate.upgrade(url)
+        await database.connect()
+        await database.close()
+    finally:
+        async with admin.connect() as connection:
+            await connection.exec_driver_sql("DROP DATABASE IF EXISTS sx_schema_test WITH (FORCE)")
+        await admin.dispose()
+
+
+async def test_driver_network_errors_become_storage_errors(tmp_path: Path) -> None:
+    # A stopped PostgreSQL container vanishes from Docker DNS: asyncpg raises a bare
+    # socket.gaierror that SQLAlchemy does not wrap, which the API turned into a 500.
+    import socket
+
+    from argus.common.errors import StorageError
+    from argus.config.settings import StorageSettings
+    from argus.storage.database import Database
+
+    database = Database(StorageSettings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'x.db'}"))
+    await database.connect()
+    driver_globals = {"__name__": "asyncpg.connect_utils", "socket": socket}
+    exec(  # noqa: S102 - builds a function that appears to live in the driver package
+        "def connect_addr():\n    raise socket.gaierror(-2, 'Name or service not known')",
+        driver_globals,
+    )
+    with pytest.raises(StorageError, match="database unavailable"):
+        async with database.session():
+            driver_globals["connect_addr"]()
+    # An OSError from application code inside a session is not a storage outage.
+    with pytest.raises(FileNotFoundError):
+        async with database.session():
+            raise FileNotFoundError(str(tmp_path / "missing.txt"))
+    await database.close()

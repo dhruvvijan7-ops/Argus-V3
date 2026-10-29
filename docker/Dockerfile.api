@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1.7
+# Argus API + detection pipeline.
+
+FROM python:3.12-slim-bookworm AS build
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+WORKDIR /src
+COPY pyproject.toml README.md ./
+COPY packages ./packages
+RUN pip wheel --wheel-dir /wheels ".[ml]"
+
+FROM python:3.12-slim-bookworm AS runtime
+LABEL org.opencontainers.image.title="argus-api" \
+      org.opencontainers.image.description="Argus network intrusion detection and prevention API" \
+      org.opencontainers.image.licenses="MIT"
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 \
+    RULES_DIRECTORY=/app/rules PCAP_DIRECTORY=/data/pcaps API_HOST=0.0.0.0 API_PORT=8000 LOG_FORMAT=json
+
+# libpcap: BPF filter compilation. nftables/iptables: firewall adapters (only used when
+# FIREWALL_BACKEND is set and the container has CAP_NET_ADMIN). tini: signal handling.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libpcap0.8 nftables iptables libcap2-bin tini \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /wheels /wheels
+# pip is only needed to install the wheels: remove it so the runtime image does not ship
+# the base image's installer (and its advisories).
+RUN pip install /wheels/*.whl && rm -rf /wheels \
+ && python3 -m pip uninstall -y pip
+
+# Live capture and firewall changes need CAP_NET_RAW / CAP_NET_ADMIN. They are granted
+# to a *separate* interpreter used only by the capture sensor. Setting file
+# capabilities on the shared python3 would stop every other container (api, migrate)
+# from starting: the kernel refuses to exec a binary whose file capabilities are not
+# in the container's bounding set. The sensor runs `python3-sensor -m argus`.
+RUN install -m 0755 "$(readlink -f "$(command -v python3)")" /usr/local/bin/python3-sensor \
+ && setcap cap_net_raw,cap_net_admin+eip /usr/local/bin/python3-sensor
+
+RUN groupadd --system --gid 10001 argus \
+ && useradd --system --uid 10001 --gid argus --home-dir /app --shell /usr/sbin/nologin argus \
+ && mkdir -p /app /data/pcaps /data/models && chown -R argus:argus /app /data
+WORKDIR /app
+COPY --chown=argus:argus rules ./rules
+USER argus
+
+EXPOSE 8000
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
+  CMD python3 -c "import os,sys,urllib.request; port=os.environ.get('API_PORT','8000'); host=os.environ.get('API_HOST','127.0.0.1'); host='127.0.0.1' if host in ('0.0.0.0','::','') else host; host=f'[{host}]' if ':' in host else host; sys.exit(0 if urllib.request.urlopen(f'http://{host}:{port}/api/v1/system/health', timeout=4).status == 200 else 1)"
+ENTRYPOINT ["tini", "--"]
+CMD ["argus", "start"]

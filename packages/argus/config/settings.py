@@ -1,0 +1,832 @@
+"""Typed configuration, loaded once from the environment.
+
+Every environment-specific value in Argus lives here.  The few other environment
+reads are not settings: host detection (WSL, container, ``SYSTEMROOT``), CLI defaults
+and the ``--capture`` hand-off to the server; docs/deployment.md lists them.
+Settings are grouped into nested models so that a
+detector can be handed just ``settings.detection`` rather than the whole world,
+which keeps the security core testable without an environment at all.
+
+Safety defaults are deliberate and documented in :mod:`argus.response.safety`:
+``RESPONSE_MODE=detect_only`` and ``DRY_RUN=true`` mean a fresh install observes
+and explains but never touches traffic.
+"""
+
+from __future__ import annotations
+
+import os
+import secrets
+from functools import lru_cache
+from pathlib import Path
+from typing import Annotated, Any, Literal
+
+from dotenv import dotenv_values
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
+from pydantic_settings import (
+    BaseSettings,
+    DotEnvSettingsSource,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
+
+from argus.common.enums import DetectionMode, ResponseMode
+from argus.common.netutils import parse_networks
+
+__all__ = [
+    "AnomalySettings",
+    "ApiSettings",
+    "CaptureSettings",
+    "CorrelationSettings",
+    "DetectionSettings",
+    "ResponseSettings",
+    "ScoringSettings",
+    "Settings",
+    "StorageSettings",
+    "get_settings",
+    "reload_settings",
+]
+
+Fraction = Annotated[float, Field(ge=0.0, le=1.0)]
+Percent = Annotated[float, Field(ge=0.0, le=100.0)]
+
+
+# ===================================================================== capture
+
+
+class CaptureSettings(BaseModel):
+    """Packet source configuration."""
+
+    interface: str = Field(
+        default="any",
+        description="Interface to capture from, or 'any' for every interface.",
+    )
+    backend: Literal["auto", "af_packet", "libpcap"] = Field(
+        default="auto",
+        description="Live capture backend. 'auto' uses AF_PACKET on Linux and libpcap "
+        "(BPF devices on macOS, Npcap on Windows) elsewhere.",
+    )
+    bpf_filter: str = Field(
+        default="",
+        description="Optional BPF expression applied in the kernel, before userspace sees a packet.",
+    )
+    snapshot_length: int = Field(
+        default=2048,
+        ge=64,
+        le=65535,
+        description="Bytes captured per frame. 2048 keeps full headers plus DNS/TLS handshakes.",
+    )
+    promiscuous: bool = True
+    buffer_size_mb: int = Field(default=16, ge=1, le=1024)
+    queue_size: int = Field(
+        default=20_000,
+        ge=100,
+        description="Bounded hand-off queue for the libpcap backend. When full, packets "
+        "are dropped and counted (dropped_queue) rather than growing memory.",
+    )
+    home_networks: list[str] = Field(
+        default_factory=lambda: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fd00::/8"],
+        description="Prefixes treated as 'inside'. Used only to label packet direction.",
+    )
+    pcap_directory: Path = Field(default=Path("pcaps"))
+    max_pcap_size_mb: int = Field(default=512, ge=1)
+    upload_quota_mb: int = Field(
+        default=2048,
+        ge=1,
+        description="Total space uploaded captures may use. Uploads are refused once full.",
+    )
+
+    @field_validator("home_networks")
+    @classmethod
+    def _validate_home_networks(cls, value: list[str]) -> list[str]:
+        parse_networks(value)  # raises ValueError listing every bad entry
+        return value
+
+    @field_validator("bpf_filter")
+    @classmethod
+    def _validate_bpf(cls, value: str) -> str:
+        """Reject shell metacharacters.
+
+        The filter is passed to libpcap as a string argument, never through a
+        shell, but rejecting these characters early turns a confusing pcap
+        compile error into a clear configuration error.
+        """
+        forbidden = set(";|`$\n\r\\")
+        if forbidden & set(value):
+            raise ValueError("bpf_filter must not contain shell metacharacters")
+        return value.strip()
+
+
+# =================================================================== detection
+
+
+class DetectionSettings(BaseModel):
+    """Thresholds for the built-in detectors.
+
+    Defaults are tuned against the synthetic scenarios in ``scripts/benchmark.py``
+    and the fixtures in ``tests/detection``.  They are starting points, not
+    universal truths - every deployment should re-tune using its own baseline
+    traffic, and ``docs/detection-engine.md`` explains how.
+    """
+
+    mode: DetectionMode = DetectionMode.BALANCED
+    enabled_detectors: list[str] = Field(
+        default_factory=list,
+        description="Allow-list of detector names. Empty means 'all detectors for this mode'.",
+    )
+    disabled_detectors: list[str] = Field(default_factory=list)
+
+    # --- port scanning
+    port_scan_window_seconds: float = Field(default=15.0, gt=0)
+    port_scan_unique_ports: int = Field(
+        default=20, ge=2, description="Distinct destination ports from one source that trigger."
+    )
+    port_scan_min_syn_ratio: Fraction = Field(
+        default=0.7,
+        description="Fraction of packets that must be bare SYNs. Separates scans from "
+        "legitimate multi-port clients, which complete handshakes.",
+    )
+    horizontal_scan_unique_hosts: int = Field(
+        default=25, ge=2, description="Distinct destination hosts on one port (a sweep)."
+    )
+    udp_scan_unique_ports: int = Field(default=25, ge=2)
+
+    # --- brute force
+    brute_force_window_seconds: float = Field(default=60.0, gt=0)
+    brute_force_attempts: int = Field(default=15, ge=2)
+    brute_force_ports: list[int] = Field(
+        default_factory=lambda: [22, 23, 21, 3389, 445, 5900, 1433, 3306, 5432],
+        description="Services where repeated short-lived connections imply credential guessing.",
+    )
+
+    # --- floods
+    connection_rate_window_seconds: float = Field(default=10.0, gt=0)
+    connection_rate_threshold: int = Field(default=200, ge=1)
+    syn_flood_threshold: int = Field(default=500, ge=1)
+    icmp_flood_window_seconds: float = Field(default=10.0, gt=0)
+    icmp_flood_threshold: int = Field(default=200, ge=1)
+    http_flood_window_seconds: float = Field(default=10.0, gt=0)
+    http_flood_threshold: int = Field(default=300, ge=1)
+
+    # --- DNS
+    dns_window_seconds: float = Field(default=30.0, gt=0)
+    dns_query_threshold: int = Field(default=300, ge=1)
+    dns_unique_domain_threshold: int = Field(
+        default=100,
+        ge=1,
+        description="Many distinct names from one client suggests tunnelling or DGA.",
+    )
+    dns_long_label_length: int = Field(
+        default=52,
+        ge=10,
+        le=63,
+        description="Label length above which a name looks like encoded data rather than a hostname.",
+    )
+    dns_high_entropy_threshold: float = Field(
+        default=3.8,
+        ge=0.0,
+        description="Shannon entropy (bits/char) suggesting an algorithmic name.",
+    )
+
+    # --- general
+    max_tracked_sources: int = Field(default=50_000, ge=100)
+    detection_cooldown_seconds: float = Field(
+        default=60.0,
+        ge=0,
+        description="Suppress repeat detections of the same (detector, source) pair. "
+        "Prevents one scan producing thousands of identical alerts.",
+    )
+    denylist_networks: list[str] = Field(default_factory=list)
+    allowlist_networks: list[str] = Field(
+        default_factory=list,
+        description="Sources never reported on. Applied before any detector runs.",
+    )
+
+    @field_validator("denylist_networks", "allowlist_networks")
+    @classmethod
+    def _validate_nets(cls, value: list[str]) -> list[str]:
+        parse_networks(value)
+        return value
+
+    @field_validator("brute_force_ports")
+    @classmethod
+    def _validate_ports(cls, value: list[int]) -> list[int]:
+        bad = [p for p in value if not 0 < p < 65536]
+        if bad:
+            raise ValueError(f"invalid port numbers: {bad}")
+        return value
+
+
+# ===================================================================== scoring
+
+
+class ScoringSettings(BaseModel):
+    """Weights for the risk engine.
+
+    The score is a weighted sum of factors clamped to 0-100; see
+    ``docs/risk-scoring.md``.  Exposed as settings so an operator can express
+    their own priorities (e.g. weigh threat intel heavily, ignore history).
+    """
+
+    severity_weight: float = Field(default=45.0, ge=0, le=100)
+    confidence_weight: float = Field(default=20.0, ge=0, le=100)
+    frequency_weight: float = Field(default=10.0, ge=0, le=100)
+    history_weight: float = Field(default=10.0, ge=0, le=100)
+    intel_weight: float = Field(default=15.0, ge=0, le=100)
+    correlation_weight: float = Field(default=15.0, ge=0, le=100)
+    sensitive_target_weight: float = Field(default=10.0, ge=0, le=100)
+
+    history_window_seconds: float = Field(default=3600.0, gt=0)
+    frequency_saturation: int = Field(
+        default=10,
+        ge=1,
+        description="Repeat count at which the frequency factor reaches its full weight.",
+    )
+    history_saturation: int = Field(default=5, ge=1)
+    allowlist_penalty: float = Field(
+        default=40.0,
+        ge=0,
+        le=100,
+        description="Points subtracted when the source is allowlisted but still detected. "
+        "Keeps the finding visible for tuning without escalating it.",
+    )
+
+    auto_block_threshold: Percent = Field(
+        default=85.0,
+        description="Risk at or above which an automatic block may be proposed. "
+        "Only acted on when RESPONSE_MODE=automatic and DRY_RUN=false.",
+    )
+
+
+# ================================================================= correlation
+
+
+class CorrelationSettings(BaseModel):
+    """How separate detections are folded into one incident."""
+
+    enabled: bool = True
+    window_seconds: float = Field(
+        default=600.0,
+        gt=0,
+        description="How long an incident stays open for new, related detections.",
+    )
+    min_detections: int = Field(default=2, ge=1)
+    standalone_risk_threshold: Percent = Field(
+        default=85.0,
+        description="A single critical detection at or above this risk opens an incident "
+        "without waiting for corroboration.",
+    )
+    max_open_incidents: int = Field(default=1000, ge=1)
+    group_by_source: bool = True
+    group_by_destination: bool = False
+
+
+# ==================================================================== anomaly
+
+
+class AnomalySettings(BaseModel):
+    """Statistical baselining and the optional ML layer."""
+
+    enabled: bool = True
+    baseline_alpha: Fraction = Field(
+        default=0.05, description="EWMA decay. Lower adapts more slowly and is less jumpy."
+    )
+    min_samples: int = Field(
+        default=60, ge=5, description="Observations required before deviations are reported."
+    )
+    sample_interval_seconds: float = Field(default=1.0, gt=0)
+    anomaly_threshold: Fraction = Field(
+        default=0.85, description="Anomaly score at or above which a detection is emitted."
+    )
+    sigma_saturation: float = Field(default=6.0, gt=0)
+
+    ml_enabled: bool = Field(
+        default=False,
+        description="Enable the IsolationForest detector. Off by default: it needs a trained "
+        "model, and an untrained one adds noise rather than signal.",
+    )
+    ml_model_path: Path = Field(default=Path("models/isolation_forest.joblib"))
+    ml_contamination: float = Field(
+        default=0.02,
+        gt=0,
+        lt=0.5,
+        description="Expected share of anomalies in training traffic: the default for "
+        "'argus anomaly train --contamination'.",
+    )
+    ml_min_score: Fraction = Field(default=0.75)
+
+
+# =================================================================== response
+
+
+class ResponseSettings(BaseModel):
+    """Response and firewall behaviour.
+
+    The defaults here are the single most safety-critical thing in the project.
+    Changing ``mode`` away from ``detect_only`` or ``dry_run`` away from True must
+    be a conscious act by an operator, not something that happens by upgrade.
+    """
+
+    mode: ResponseMode = ResponseMode.DETECT_ONLY
+    dry_run: bool = Field(
+        default=True,
+        description="When true, response actions are decided, recorded and displayed, "
+        "but never applied to the firewall.",
+    )
+    firewall_backend: Literal["null", "auto", "nftables", "iptables", "pf", "windows_firewall"] = (
+        Field(
+            default="null",
+            description="Where blocks are enforced. 'auto' picks nftables or iptables on "
+            "Linux, pf on macOS and Windows Firewall on Windows, if usable.",
+        )
+    )
+    nft_table: str = Field(default="argus", pattern=r"^[A-Za-z0-9_]{1,32}$")
+    nft_set: str = Field(default="blocklist", pattern=r"^[A-Za-z0-9_]{1,32}$")
+    nft_family: Literal["inet", "ip", "ip6"] = "inet"
+    pf_anchor: str = Field(
+        default="com.apple/argus",
+        pattern=r"^[A-Za-z0-9_.]{1,32}(/[A-Za-z0-9_.]{1,32})?$",
+        description="pf anchor for Argus rules. The default is evaluated by the "
+        "stock macOS pf.conf; elsewhere add 'anchor \"argus\"' to pf.conf.",
+    )
+
+    default_block_seconds: int = Field(default=900, ge=30, le=86_400)
+    max_block_seconds: int = Field(default=86_400, ge=60, le=30 * 86_400)
+    max_blocked_addresses: int = Field(
+        default=10_000,
+        ge=1,
+        le=1_000_000,
+        description="Hard cap on concurrent blocks. A runaway detector "
+        "hits this limit instead of exhausting the firewall set.",
+    )
+    max_block_prefix_hosts: int = Field(
+        default=256,
+        ge=1,
+        le=65_536,
+        description="Largest prefix that may be blocked, in addresses. 256 = a /24. "
+        "Stops a malformed rule from taking out an entire network.",
+    )
+
+    allowlist_networks: list[str] = Field(
+        default_factory=lambda: ["127.0.0.0/8", "::1/128"],
+        description="Never blocked, under any circumstances. Loopback is non-negotiable "
+        "and re-added even if removed here.",
+    )
+    protect_management_addresses: bool = Field(
+        default=True,
+        description="Refuse to block any address assigned to this host, and the address "
+        "of any operator who used the API in the last hour (so an administrator cannot "
+        "block their own workstation).",
+    )
+    management_addresses: list[str] = Field(default_factory=list)
+
+    webhook_url: str = Field(
+        default="",
+        max_length=2048,
+        description="HTTPS endpoint that receives a JSON POST for detections at or above "
+        "webhook_min_risk. Empty disables webhooks.",
+    )
+    webhook_allow_private_addresses: bool = Field(
+        default=False,
+        description="Allow the webhook host to resolve to loopback, private or link-local "
+        "addresses (an internal SIEM, say). Off by default so a changed setting cannot "
+        "turn Argus into a proxy for internal services or cloud metadata.",
+    )
+    webhook_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    webhook_min_risk: Percent = Field(default=60.0)
+
+    rate_limit_packets_per_second: int = Field(default=100, ge=1)
+
+    @field_validator("allowlist_networks", "management_addresses")
+    @classmethod
+    def _validate_nets(cls, value: list[str]) -> list[str]:
+        parse_networks(value)
+        return value
+
+    @field_validator("webhook_url")
+    @classmethod
+    def _validate_webhook(cls, value: str) -> str:
+        if not value:
+            return value
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(value)
+        if parts.scheme != "https":
+            raise ValueError("webhook_url must use https://")
+        if not parts.hostname:
+            raise ValueError("webhook_url must include a host")
+        if any(ord(ch) < 0x21 for ch in value):
+            raise ValueError("webhook_url must not contain spaces or control characters")
+        return value
+
+    @model_validator(mode="after")
+    def _guard_loopback(self) -> ResponseSettings:
+        """Force loopback into the allowlist even if an operator removed it."""
+        required = ["127.0.0.0/8", "::1/128"]
+        missing = [net for net in required if net not in self.allowlist_networks]
+        if missing:
+            self.allowlist_networks = [*self.allowlist_networks, *missing]
+        return self
+
+    @model_validator(mode="after")
+    def _guard_prevention(self) -> ResponseSettings:
+        """A real firewall backend is required before responses can be applied.
+
+        ``automatic`` and ``manual_approval`` both apply actions once dry run is off.
+        With no backend they could only fail, so refuse the configuration up front.
+        (``detect_only`` never applies engine decisions; a manual block there still
+        fails loudly at the ``null`` backend rather than pretending to succeed.)
+        """
+        if (
+            self.mode in (ResponseMode.AUTOMATIC, ResponseMode.MANUAL_APPROVAL)
+            and not self.dry_run
+            and self.firewall_backend == "null"
+        ):
+            raise ValueError(
+                f"RESPONSE_MODE={self.mode.value} with DRY_RUN=false requires a real "
+                "FIREWALL_BACKEND for this host, not 'null'"
+            )
+        return self
+
+    @property
+    def prevention_active(self) -> bool:
+        """True only when responses will genuinely alter traffic."""
+        return self.mode is ResponseMode.AUTOMATIC and not self.dry_run
+
+
+# ==================================================================== storage
+
+
+class StorageSettings(BaseModel):
+    """Database, Redis and retention."""
+
+    database_url: str = Field(
+        default="sqlite+aiosqlite:///./argus.db",
+        description="SQLAlchemy async URL. PostgreSQL is the supported production target; "
+        "the SQLite default exists so the platform runs with zero infrastructure.",
+    )
+    database_echo: bool = False
+    pool_size: int = Field(default=10, ge=1)
+    max_overflow: int = Field(default=20, ge=0)
+    # A database that stops answering without refusing connections (a paused or
+    # partitioned server) would otherwise hold requests and writes for minutes, until
+    # the kernel gives up on the TCP connection. PostgreSQL only.
+    connect_timeout_seconds: float = Field(
+        default=10.0, gt=0, le=300, description="PostgreSQL: seconds to establish a connection."
+    )
+    statement_timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        le=3600,
+        description="PostgreSQL: seconds a single statement may run before it is abandoned.",
+    )
+    pool_timeout_seconds: float = Field(
+        default=10.0, gt=0, le=300, description="Seconds to wait for a free pooled connection."
+    )
+    session_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        le=3600,
+        description="Seconds one unit of database work (an API request's session) may take "
+        "in total, waiting for a connection included. Past it the connection is discarded "
+        "without waiting on the server and the API answers 503. Event batches and "
+        "retention purges have longer limits of their own.",
+    )
+
+    redis_url: str = Field(default="redis://localhost:6379/0")
+    redis_required: bool = Field(
+        default=False,
+        description="When false, Redis failures degrade to in-process counters "
+        "instead of taking the platform down.",
+    )
+    redis_namespace: str = Field(default="argus", pattern=r"^[A-Za-z0-9_:-]{1,64}$")
+
+    retention_days: int = Field(default=30, ge=1, le=3650)
+    audit_retention_days: int = Field(
+        default=365, ge=1, description="Audit events are kept far longer than telemetry."
+    )
+    metrics_retention_days: int = Field(default=7, ge=1)
+    batch_size: int = Field(
+        default=200, ge=1, description="Rows flushed to the database per write."
+    )
+    flush_interval_seconds: float = Field(default=2.0, gt=0)
+
+    @property
+    def is_postgres(self) -> bool:
+        return self.database_url.startswith(("postgresql", "postgres"))
+
+    @property
+    def is_sqlite(self) -> bool:
+        return self.database_url.startswith("sqlite")
+
+
+# ======================================================================== api
+
+
+class ApiSettings(BaseModel):
+    """HTTP/WebSocket server and authentication."""
+
+    host: str = "127.0.0.1"
+    port: int = Field(default=8000, ge=1, le=65535)
+    root_path: str = ""
+    cors_origins: list[str] = Field(
+        default_factory=lambda: ["http://localhost:3000"],
+        description="Explicit origins. '*' is rejected when authentication is enabled, "
+        "because credentialed requests from any origin defeat the point.",
+    )
+
+    jwt_secret: str = Field(default="", description="HS256 signing key. Required in production.")
+    jwt_algorithm: Literal["HS256", "HS384", "HS512"] = "HS256"
+    access_token_ttl_seconds: int = Field(
+        default=900, ge=60, le=86_400, description="Short-lived; the dashboard refreshes silently."
+    )
+    refresh_token_ttl_seconds: int = Field(default=604_800, ge=300)
+    jwt_issuer: str = "argus"
+    cookie_secure: bool = Field(
+        default=False,
+        description="Mark auth cookies Secure (HTTPS only). Forced on in production.",
+    )
+    password_min_length: int = Field(default=12, ge=8, le=128)
+    lockout_threshold: int = Field(
+        default=5, ge=1, description="Failed logins before an account locks."
+    )
+    lockout_seconds: int = Field(default=900, ge=30)
+
+    auth_enabled: bool = True
+    bootstrap_admin_username: str = Field(default="admin", min_length=3, max_length=64)
+    bootstrap_admin_password: str = Field(
+        default="",
+        description="Used only to create the first admin when the user table is empty. "
+        "If unset, a password is generated and written to bootstrap_password_file.",
+    )
+    bootstrap_password_file: Path | None = Field(
+        default=None,
+        description="Where a generated first-admin password is written, readable only by "
+        "the service account, and removed once the password is changed. Default: "
+        "<temp directory>/argus-<uid>/initial-admin-password. It is never printed, "
+        "because console output is kept by docker logs and the systemd journal.",
+    )
+
+    rate_limit_requests: int = Field(default=300, ge=1)
+    rate_limit_window_seconds: int = Field(default=60, ge=1)
+    login_rate_limit_attempts: int = Field(default=8, ge=1)
+    login_rate_limit_window_seconds: int = Field(default=300, ge=1)
+
+    websocket_max_queue: int = Field(
+        default=500,
+        ge=10,
+        description="Per-connection outbound buffer. A slow dashboard is disconnected "
+        "rather than allowed to back-pressure the detection pipeline.",
+    )
+    max_upload_mb: int = Field(default=200, ge=1)
+    trusted_proxies: list[str] = Field(
+        default_factory=list,
+        description="CIDRs of reverse proxies whose X-Forwarded-For header is believed. "
+        "Empty means the header is ignored, so clients cannot spoof their address.",
+    )
+    metrics_token: str = Field(
+        default="",
+        description="Bearer token for the Prometheus endpoint. When empty, metrics are "
+        "served to loopback clients only.",
+    )
+    docs_enabled: bool = Field(
+        default=True, description="Serve interactive OpenAPI docs. Disabled in production."
+    )
+
+    @field_validator("trusted_proxies")
+    @classmethod
+    def _validate_proxies(cls, value: list[str]) -> list[str]:
+        parse_networks(value)
+        return value
+
+    @field_validator("cors_origins")
+    @classmethod
+    def _validate_origins(cls, value: list[str], info: ValidationInfo) -> list[str]:
+        for origin in value:
+            if origin != "*" and not origin.startswith(("http://", "https://")):
+                raise ValueError(f"CORS origin {origin!r} must include a scheme")
+        return value
+
+
+# =================================================================== telemetry
+
+
+class TelemetrySettings(BaseModel):
+    """Logging and metrics."""
+
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    log_format: Literal["console", "json"] = "console"
+    log_file: Path | None = None
+    metrics_enabled: bool = Field(
+        default=True, description="Serve Prometheus metrics at /api/v1/metrics (404 when false)."
+    )
+    profile_pipeline: bool = Field(
+        default=False,
+        description="Record per-stage latency (argus_stage_latency_seconds{stage}). Small "
+        "but non-zero cost per packet.",
+    )
+
+
+# ============================================================== flat aliases
+
+#: Short variable names from the project brief, mapped onto their nested fields.
+FLAT_ALIASES: dict[str, tuple[str, str]] = {
+    "DATABASE_URL": ("storage", "database_url"),
+    "REDIS_URL": ("storage", "redis_url"),
+    "RETENTION_DAYS": ("storage", "retention_days"),
+    "API_HOST": ("api", "host"),
+    "API_PORT": ("api", "port"),
+    "JWT_SECRET": ("api", "jwt_secret"),
+    "CORS_ORIGINS": ("api", "cors_origins"),
+    "CAPTURE_INTERFACE": ("capture", "interface"),
+    "BPF_FILTER": ("capture", "bpf_filter"),
+    "PCAP_DIRECTORY": ("capture", "pcap_directory"),
+    "DETECTION_MODE": ("detection", "mode"),
+    "RESPONSE_MODE": ("response", "mode"),
+    "DRY_RUN": ("response", "dry_run"),
+    "FIREWALL_BACKEND": ("response", "firewall_backend"),
+    "LOG_LEVEL": ("telemetry", "log_level"),
+    "LOG_FORMAT": ("telemetry", "log_format"),
+}
+_LIST_ALIASES = frozenset({"CORS_ORIGINS"})
+
+
+class FlatAliasSource(PydanticBaseSettingsSource):
+    """Reads :data:`FLAT_ALIASES` from the process environment or a dotenv file.
+
+    Values are passed through as strings, so pydantic validates them exactly like
+    the nested form: ``DRY_RUN=ture`` is a configuration error, never a silent
+    ``False``.
+    """
+
+    def __init__(self, settings_cls: type[BaseSettings], env_file: Any) -> None:
+        super().__init__(settings_cls)
+        self._env_file = env_file
+
+    def _raw_values(self) -> dict[str, str | None]:
+        if self._env_file is None:
+            return {key.upper(): value for key, value in os.environ.items()}
+        files = self._env_file if isinstance(self._env_file, list | tuple) else [self._env_file]
+        merged: dict[str, str | None] = {}
+        for file in files:
+            path = Path(file).expanduser()
+            if path.is_file():
+                values = dotenv_values(path, encoding="utf-8")
+                merged.update({key.upper(): value for key, value in values.items()})
+        return merged
+
+    def get_field_value(self, field: Any, field_name: str) -> tuple[Any, str, bool]:
+        # Unused: __call__ builds the whole mapping at once.
+        return None, field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        raw = self._raw_values()
+        data: dict[str, dict[str, Any]] = {}
+        for env_name, (section, field_name) in FLAT_ALIASES.items():
+            value = raw.get(env_name)
+            if value is None or value == "":
+                continue
+            parsed: Any = value
+            if env_name in _LIST_ALIASES:
+                parsed = [part.strip() for part in value.split(",") if part.strip()]
+            data.setdefault(section, {})[field_name] = parsed
+        return data
+
+
+# ==================================================================== root
+
+
+class Settings(BaseSettings):
+    """Root settings object.
+
+    Environment variables map to nested fields with a double underscore, e.g.
+    ``DETECTION__PORT_SCAN_UNIQUE_PORTS=30``.  The flat aliases required by the
+    project brief (``DATABASE_URL``, ``DRY_RUN``, ...) are also supported, from both
+    the environment and ``.env``; see :meth:`settings_customise_sources`.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_nested_delimiter="__",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    environment: Literal["development", "staging", "production"] = "development"
+    sensor_name: str = Field(default="argus-local", min_length=1, max_length=64)
+
+    capture: CaptureSettings = Field(default_factory=CaptureSettings)
+    detection: DetectionSettings = Field(default_factory=DetectionSettings)
+    scoring: ScoringSettings = Field(default_factory=ScoringSettings)
+    correlation: CorrelationSettings = Field(default_factory=CorrelationSettings)
+    anomaly: AnomalySettings = Field(default_factory=AnomalySettings)
+    response: ResponseSettings = Field(default_factory=ResponseSettings)
+    storage: StorageSettings = Field(default_factory=StorageSettings)
+    api: ApiSettings = Field(default_factory=ApiSettings)
+    telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
+
+    rules_directory: Path = Field(default=Path("rules"))
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Add the documented flat aliases (``DRY_RUN``, ``DATABASE_URL``...).
+
+        Precedence, highest first: explicit arguments, nested environment variables,
+        flat environment variables, nested ``.env`` entries, flat ``.env`` entries,
+        defaults. So a real environment variable always beats the ``.env`` file, and
+        the nested form wins when both spellings are set at the same level.
+        """
+        env_file = settings_cls.model_config.get("env_file")
+        if isinstance(dotenv_settings, DotEnvSettingsSource):
+            env_file = dotenv_settings.env_file
+        return (
+            init_settings,
+            env_settings,
+            FlatAliasSource(settings_cls, None),
+            dotenv_settings,
+            FlatAliasSource(settings_cls, env_file),
+            file_secret_settings,
+        )
+
+    @model_validator(mode="after")
+    def _validate_production(self) -> Settings:
+        """Refuse insecure configurations in production rather than warning about them."""
+        if self.environment != "production":
+            if not self.api.jwt_secret:
+                # Dev convenience: a per-process ephemeral secret. Tokens do not
+                # survive a restart, which is correct for development.
+                self.api.jwt_secret = secrets.token_urlsafe(48)
+            return self
+
+        problems: list[str] = []
+        self.api.cookie_secure = True
+        self.api.docs_enabled = False
+        if len(self.api.jwt_secret) < 32:
+            problems.append("JWT_SECRET must be set to at least 32 characters in production")
+        if not self.api.auth_enabled:
+            problems.append("authentication cannot be disabled in production")
+        if "*" in self.api.cors_origins:
+            problems.append("CORS origin '*' is not permitted in production")
+        if self.storage.is_sqlite:
+            problems.append("SQLite is not supported in production; set DATABASE_URL to PostgreSQL")
+        if problems:
+            raise ValueError("invalid production configuration: " + "; ".join(problems))
+        return self
+
+    @property
+    def prevention_active(self) -> bool:
+        return self.response.prevention_active
+
+    def safety_banner(self) -> str:
+        """One line saying what Argus may do to traffic right now.
+
+        The part before `` - `` is the posture shown on the dashboard's safety chip. It
+        reflects every path that can change the firewall, including manual blocks and
+        approvals, not only automatic responses.
+        """
+        response = self.response
+        backend = response.firewall_backend
+        if response.dry_run:
+            if response.mode is ResponseMode.DETECT_ONLY:
+                return "DETECTION ONLY - no traffic will be modified"
+            return "DRY RUN - response decisions are recorded and shown but not applied"
+        if backend == "null":
+            target = "but no firewall backend is configured, so they will be refused"
+        elif backend == "auto":
+            target = "and will modify this host's firewall (backend chosen automatically)"
+        else:
+            target = f"and will modify the {backend} firewall on this host"
+        if self.prevention_active:
+            return f"PREVENTION ACTIVE - automatic responses are enforced {target}"
+        if response.mode is ResponseMode.MANUAL_APPROVAL:
+            return f"MANUAL APPROVAL - approved responses are enforced {target}"
+        return f"MANUAL BLOCKS ENFORCED - automatic responses are off; administrator blocks are enforced {target}"
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """The process-wide settings singleton.
+
+    Cached so that importing settings from anywhere is cheap and always yields the
+    same object.  Call :func:`reload_settings` in tests that need to vary config.
+    """
+    return Settings()
+
+
+def reload_settings() -> Settings:
+    """Clear the cache and re-read the environment. Intended for tests and the CLI."""
+    get_settings.cache_clear()
+    return get_settings()

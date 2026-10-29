@@ -1,0 +1,52 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets and local state
+.env
+.demo/
+.env.*
+!.env.example
+.env.bak*
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+
+# Backups
+*.bak*
+
+# Captures and models are data, not source (fixtures are regenerated with `make fixtures`)
+# Test fixtures under tests/pcaps/ and pcaps/.gitkeep are tracked on purpose.
+pcaps/*
+!pcaps/.gitkeep
+*.pcap
+*.pcapng
+!tests/pcaps/**
+models/
+
+# Benchmark reports cited by docs/benchmarking.md are committed (benchmarks/results/).
+
+# Dashboard
+apps/dashboard/node_modules/
+apps/dashboard/.next/
+apps/dashboard/next-env.d.ts
+apps/dashboard/*.tsbuildinfo
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

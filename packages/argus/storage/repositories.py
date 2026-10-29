@@ -1,0 +1,950 @@
+"""Data access.
+
+Every query is built with SQLAlchemy expressions and bound parameters; no SQL text
+is ever assembled from input.  Free-text search escapes ``%`` and ``_`` so a search
+for ``100%`` means the literal string.
+
+Repositories take a session and never commit - the caller's unit of work does, via
+:meth:`argus.storage.database.Database.session`.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from sqlalchemy import ColumnElement, Select, and_, delete, func, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from argus.storage.models import (
+    AuditEvent,
+    BlockRecord,
+    DetectionRecord,
+    IncidentRecord,
+    RefreshToken,
+    ReplayRecord,
+    ResponseActionRecord,
+    RuleRecord,
+    SettingRecord,
+    SystemMetric,
+    TrafficSummary,
+    User,
+)
+
+__all__ = [
+    "AnalyticsRepository",
+    "AuditRepository",
+    "BlockRepository",
+    "DetectionFilter",
+    "DetectionRepository",
+    "IncidentRepository",
+    "Page",
+    "ReplayRepository",
+    "ResponseActionRepository",
+    "RetentionRepository",
+    "RuleRepository",
+    "SettingRepository",
+    "TelemetryRepository",
+    "UserRepository",
+]
+
+MAX_PAGE_SIZE = 500
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+MAX_OFFSET = 1_000_000
+
+
+def _clamp(limit: int, offset: int) -> tuple[int, int]:
+    # Offsets are bounded too: a huge value overflows the database driver (a 500).
+    return max(1, min(limit, MAX_PAGE_SIZE)), max(0, min(offset, MAX_OFFSET))
+
+
+@dataclass(slots=True)
+class Page[T]:
+    items: list[T]
+    total: int
+    limit: int
+    offset: int
+
+
+# ====================================================================== users
+
+
+class UserRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def get(self, user_id: int) -> User | None:
+        return await self.session.get(User, user_id)
+
+    async def by_username(self, username: str) -> User | None:
+        result = await self.session.execute(
+            select(User).where(func.lower(User.username) == username.lower())
+        )
+        return result.scalar_one_or_none()
+
+    async def count(self) -> int:
+        return int(await self.session.scalar(select(func.count()).select_from(User)) or 0)
+
+    async def all(self) -> list[User]:
+        return list((await self.session.execute(select(User).order_by(User.username))).scalars())
+
+    async def add(self, user: User) -> User:
+        self.session.add(user)
+        await self.session.flush()
+        return user
+
+    async def delete(self, user: User) -> None:
+        await self.session.delete(user)
+
+    async def store_refresh_token(self, jti: str, user_id: int, expires_at: datetime) -> None:
+        self.session.add(RefreshToken(jti=jti, user_id=user_id, expires_at=expires_at))
+
+    async def refresh_token(self, jti: str) -> RefreshToken | None:
+        return await self.session.get(RefreshToken, jti)
+
+    async def claim_refresh_token(self, jti: str) -> bool:
+        """Atomically mark a refresh token used. False if it was already used or revoked.
+
+        A single conditional UPDATE, so two concurrent refreshes presenting the same
+        token cannot both succeed; the loser is treated as token reuse.
+        """
+        result = await self.session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.jti == jti, RefreshToken.revoked_at.is_(None))
+            .values(revoked_at=datetime.now(UTC))
+        )
+        return bool(getattr(result, "rowcount", 0))
+
+    async def end_sessions(self, user_id: int) -> None:
+        """Delete the user's unused refresh tokens (logout, password change or reset).
+
+        Deleted, not marked revoked: a revoked token presented again is treated as
+        theft and ends every session, including the one a password change just
+        started. Tokens already rotated keep their record, so reuse of a stolen token
+        is still detected.
+
+        Also records the cut-off after which access tokens issued earlier are refused.
+        Whole seconds, like the tokens' ``iat``: the caller's fresh session, issued in
+        the same second, stays valid.
+        """
+        await self.session.execute(
+            delete(RefreshToken).where(
+                RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None)
+            )
+        )
+        await self.session.execute(
+            update(User)
+            .where(User.id == user_id)
+            .values(sessions_ended_at=datetime.now(UTC).replace(microsecond=0))
+        )
+
+    async def revoke_tokens(self, user_id: int) -> None:
+        await self.session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
+            .values(revoked_at=datetime.now(UTC))
+        )
+
+
+# ================================================================ detections
+
+
+@dataclass(slots=True)
+class DetectionFilter:
+    severities: list[str] = field(default_factory=list)
+    detectors: list[str] = field(default_factory=list)
+    categories: list[str] = field(default_factory=list)
+    statuses: list[str] = field(default_factory=list)
+    source_ip: str | None = None
+    destination_ip: str | None = None
+    protocol: str | None = None
+    incident_id: str | None = None
+    replay_id: str | None = None
+    include_replays: bool = False
+    since: datetime | None = None
+    until: datetime | None = None
+    min_risk: float | None = None
+    search: str | None = None
+
+    def apply(self, query: Select[Any]) -> Select[Any]:
+        model = DetectionRecord
+        conditions: list[ColumnElement[bool]] = []
+        if self.severities:
+            conditions.append(model.severity.in_(self.severities))
+        if self.detectors:
+            conditions.append(model.detector.in_(self.detectors))
+        if self.categories:
+            conditions.append(model.category.in_(self.categories))
+        if self.statuses:
+            conditions.append(model.status.in_(self.statuses))
+        if self.source_ip:
+            conditions.append(model.source_ip == self.source_ip)
+        if self.destination_ip:
+            conditions.append(model.destination_ip == self.destination_ip)
+        if self.protocol:
+            conditions.append(model.protocol == self.protocol.lower())
+        if self.incident_id:
+            conditions.append(model.incident_id == self.incident_id)
+        if self.replay_id:
+            conditions.append(model.replay_id == self.replay_id)
+        elif not self.include_replays:
+            conditions.append(model.replay_id.is_(None))
+        if self.since:
+            conditions.append(model.timestamp >= self.since)
+        if self.until:
+            conditions.append(model.timestamp <= self.until)
+        if self.min_risk is not None:
+            conditions.append(model.risk_score >= self.min_risk)
+        if self.search:
+            pattern = f"%{_escape_like(self.search.strip()[:200])}%"
+            conditions.append(
+                or_(
+                    model.title.ilike(pattern, escape="\\"),
+                    model.description.ilike(pattern, escape="\\"),
+                    model.source_ip.ilike(pattern, escape="\\"),
+                    model.detector.ilike(pattern, escape="\\"),
+                )
+            )
+        return query.where(and_(*conditions)) if conditions else query
+
+
+class DetectionRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def add(self, record: DetectionRecord) -> None:
+        self.session.add(record)
+
+    async def get(self, detection_id: str) -> DetectionRecord | None:
+        return await self.session.get(DetectionRecord, detection_id)
+
+    async def existing_ids(self, detection_ids: list[str]) -> set[str]:
+        """Which of ``detection_ids`` are already stored (one query per 1,000 ids)."""
+        found: set[str] = set()
+        unique = list(dict.fromkeys(detection_ids))
+        for start in range(0, len(unique), 1000):
+            rows = await self.session.scalars(
+                select(DetectionRecord.detection_id).where(
+                    DetectionRecord.detection_id.in_(unique[start : start + 1000])
+                )
+            )
+            found.update(rows)
+        return found
+
+    async def page(
+        self, filters: DetectionFilter, *, limit: int = 50, offset: int = 0, order: str = "newest"
+    ) -> Page[DetectionRecord]:
+        limit, offset = _clamp(limit, offset)
+        base = filters.apply(select(DetectionRecord))
+        total = int(
+            await self.session.scalar(
+                filters.apply(select(func.count()).select_from(DetectionRecord))
+            )
+            or 0
+        )
+        ordering: Any = {
+            "newest": DetectionRecord.timestamp.desc(),
+            "oldest": DetectionRecord.timestamp.asc(),
+            "risk": DetectionRecord.risk_score.desc(),
+        }.get(order, DetectionRecord.timestamp.desc())
+        # detection_id breaks ties, so offset pages never repeat or skip rows that share
+        # a timestamp or score (common in bursts and replays).
+        rows = await self.session.execute(
+            base.order_by(ordering, DetectionRecord.detection_id).limit(limit).offset(offset)
+        )
+        return Page(list(rows.scalars()), total, limit, offset)
+
+    async def by_source(
+        self, filters: DetectionFilter, *, limit: int = 100, destinations: int = 20
+    ) -> list[dict[str, Any]]:
+        """Detections aggregated per source address, highest risk first.
+
+        Every count, the risk maximum and first/last seen are computed in the database
+        over *all* matching detections, not a sample, in five queries whatever the
+        number of rows or sources. Each entry has ``source_ip``, ``detections``,
+        ``max_risk``, ``first_seen``, ``last_seen``, ``breakdown`` (``(severity,
+        status, category, detector, count)`` tuples), ``destinations`` (the first
+        ``destinations`` in sort order), ``incident_ids`` and ``top_detection`` (the
+        highest-risk record, ties broken by ``detection_id``).
+        """
+        model = DetectionRecord
+        limit = max(1, min(limit, MAX_PAGE_SIZE))
+        count = func.count().label("detections")
+        max_risk = func.max(model.risk_score).label("max_risk")
+        sources = await self.session.execute(
+            filters.apply(
+                select(
+                    model.source_ip,
+                    count,
+                    max_risk,
+                    func.min(model.timestamp).label("first_seen"),
+                    func.max(model.timestamp).label("last_seen"),
+                )
+            )
+            .group_by(model.source_ip)
+            .order_by(max_risk.desc(), count.desc(), model.source_ip)
+            .limit(limit)
+        )
+        entries: dict[str, dict[str, Any]] = {
+            row.source_ip: {
+                "source_ip": row.source_ip,
+                "detections": int(row.detections),
+                "max_risk": float(row.max_risk or 0.0),
+                "first_seen": row.first_seen,
+                "last_seen": row.last_seen,
+                "breakdown": [],
+                "destinations": [],
+                "incident_ids": [],
+                "top_detection": None,
+            }
+            for row in sources
+        }
+        if not entries:
+            return []
+        scoped = model.source_ip.in_(list(entries))
+
+        breakdown = await self.session.execute(
+            filters.apply(
+                select(
+                    model.source_ip,
+                    model.severity,
+                    model.status,
+                    model.category,
+                    model.detector,
+                    func.count(),
+                ).where(scoped)
+            ).group_by(
+                model.source_ip, model.severity, model.status, model.category, model.detector
+            )
+        )
+        for ip, severity, status, category, detector, total in breakdown:
+            entries[ip]["breakdown"].append((severity, status, category, detector, int(total)))
+
+        # A sweep can reach thousands of destinations: only the first few per source
+        # leave the database.
+        pairs = (
+            filters.apply(
+                select(model.source_ip, model.destination_ip).where(
+                    scoped, model.destination_ip.is_not(None)
+                )
+            )
+            .distinct()
+            .subquery()
+        )
+        ranked = select(
+            pairs.c.source_ip,
+            pairs.c.destination_ip,
+            func.row_number()
+            .over(partition_by=pairs.c.source_ip, order_by=pairs.c.destination_ip)
+            .label("position"),
+        ).subquery()
+        for ip, destination in await self.session.execute(
+            select(ranked.c.source_ip, ranked.c.destination_ip)
+            .where(ranked.c.position <= destinations)
+            .order_by(ranked.c.source_ip, ranked.c.destination_ip)
+        ):
+            entries[ip]["destinations"].append(destination)
+
+        for ip, incident_id in await self.session.execute(
+            filters.apply(
+                select(model.source_ip, model.incident_id).where(
+                    scoped, model.incident_id.is_not(None)
+                )
+            )
+            .distinct()
+            .order_by(model.source_ip, model.incident_id)
+        ):
+            entries[ip]["incident_ids"].append(incident_id)
+
+        top = filters.apply(
+            select(
+                model.detection_id,
+                func.row_number()
+                .over(
+                    partition_by=model.source_ip,
+                    order_by=(model.risk_score.desc(), model.detection_id),
+                )
+                .label("position"),
+            ).where(scoped)
+        ).subquery()
+        for record in await self.session.scalars(
+            select(model)
+            .join(top, model.detection_id == top.c.detection_id)
+            .where(top.c.position == 1)
+        ):
+            entries[record.source_ip]["top_detection"] = record
+        return list(entries.values())
+
+    async def set_status(
+        self, detection_id: str, status: str, reviewer: str
+    ) -> DetectionRecord | None:
+        record = await self.get(detection_id)
+        if record is None:
+            return None
+        record.status = status
+        record.reviewed_by = reviewer
+        record.reviewed_at = datetime.now(UTC)
+        return record
+
+    async def link_incident(self, detection_ids: list[str], incident_id: str) -> None:
+        # Chunked: PostgreSQL drivers cap bound parameters per statement (32,767).
+        for start in range(0, len(detection_ids), 1000):
+            await self.session.execute(
+                update(DetectionRecord)
+                .where(DetectionRecord.detection_id.in_(detection_ids[start : start + 1000]))
+                .values(incident_id=incident_id)
+            )
+
+
+# ================================================================= incidents
+
+
+class IncidentRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def highest_risk(self, statuses: list[str]) -> float:
+        """The highest risk score among incidents in ``statuses`` (0 when there are none)."""
+        value = await self.session.scalar(
+            select(func.max(IncidentRecord.risk_score)).where(
+                IncidentRecord.status.in_(statuses), IncidentRecord.replay_id.is_(None)
+            )
+        )
+        return float(value or 0.0)
+
+    async def get(self, incident_id: str) -> IncidentRecord | None:
+        return await self.session.get(IncidentRecord, incident_id)
+
+    async def upsert(self, values: dict[str, Any]) -> IncidentRecord:
+        record = await self.get(values["incident_id"])
+        if record is None:
+            record = IncidentRecord(**values)
+            self.session.add(record)
+        else:
+            # Analyst-owned fields are never overwritten by the engine.
+            for key, value in values.items():
+                if key not in {"status", "assigned_to", "notes", "created_at"}:
+                    setattr(record, key, value)
+        await self.session.flush()
+        return record
+
+    async def page(
+        self,
+        *,
+        statuses: list[str] | None = None,
+        severities: list[str] | None = None,
+        min_risk: float | None = None,
+        include_replays: bool = False,
+        replay_id: str | None = None,
+        since: datetime | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Page[IncidentRecord]:
+        limit, offset = _clamp(limit, offset)
+        conditions: list[ColumnElement[bool]] = []
+        if statuses:
+            conditions.append(IncidentRecord.status.in_(statuses))
+        if severities:
+            conditions.append(IncidentRecord.severity.in_(severities))
+        if min_risk is not None:
+            conditions.append(IncidentRecord.risk_score >= min_risk)
+        if replay_id:
+            conditions.append(IncidentRecord.replay_id == replay_id)
+        elif not include_replays:
+            conditions.append(IncidentRecord.replay_id.is_(None))
+        if since:
+            conditions.append(IncidentRecord.last_seen >= since)
+        where = and_(*conditions) if conditions else None
+        count_query = select(func.count()).select_from(IncidentRecord)
+        query = select(IncidentRecord)
+        if where is not None:
+            count_query = count_query.where(where)
+            query = query.where(where)
+        total = int(await self.session.scalar(count_query) or 0)
+        rows = await self.session.execute(
+            query.order_by(IncidentRecord.last_seen.desc(), IncidentRecord.incident_id)
+            .limit(limit)
+            .offset(offset)
+        )
+        return Page(list(rows.scalars()), total, limit, offset)
+
+    async def detections(self, incident_id: str) -> list[DetectionRecord]:
+        rows = await self.session.execute(
+            select(DetectionRecord)
+            .where(DetectionRecord.incident_id == incident_id)
+            .order_by(DetectionRecord.timestamp, DetectionRecord.detection_id)
+        )
+        return list(rows.scalars())
+
+
+# ================================================================== response
+
+
+class ResponseActionRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def add(self, record: ResponseActionRecord) -> None:
+        self.session.add(record)
+
+    async def existing_decision_ids(self, decision_ids: list[str]) -> set[str]:
+        """Which of ``decision_ids`` are already stored (one query per 1,000 ids)."""
+        found: set[str] = set()
+        unique = list(dict.fromkeys(decision_ids))
+        for start in range(0, len(unique), 1000):
+            rows = await self.session.scalars(
+                select(ResponseActionRecord.decision_id).where(
+                    ResponseActionRecord.decision_id.in_(unique[start : start + 1000])
+                )
+            )
+            found.update(rows)
+        return found
+
+    async def page(
+        self,
+        *,
+        target: str | None = None,
+        outcomes: list[str] | None = None,
+        incident_id: str | None = None,
+        detection_id: str | None = None,
+        detection_ids: list[str] | None = None,
+        include_alerts: bool = False,
+        include_replays: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Page[ResponseActionRecord]:
+        """Response decisions, newest first.
+
+        Alerts (one per detection) and decisions made during capture replays are
+        excluded unless asked for: they would otherwise bury the actions that changed,
+        or could have changed, the firewall.
+        """
+        limit, offset = _clamp(limit, offset)
+        conditions: list[ColumnElement[bool]] = []
+        if not include_alerts:
+            conditions.append(ResponseActionRecord.action != "alert")
+        if not include_replays:
+            conditions.append(ResponseActionRecord.replay_id.is_(None))
+        if target:
+            conditions.append(ResponseActionRecord.target == target)
+        if outcomes:
+            conditions.append(ResponseActionRecord.outcome.in_(outcomes))
+        if incident_id and detection_ids:
+            # An incident's actions: those on the incident plus those on its detections.
+            conditions.append(
+                or_(
+                    ResponseActionRecord.incident_id == incident_id,
+                    ResponseActionRecord.detection_id.in_(detection_ids[:500]),
+                )
+            )
+        elif incident_id:
+            conditions.append(ResponseActionRecord.incident_id == incident_id)
+        if detection_id:
+            conditions.append(ResponseActionRecord.detection_id == detection_id)
+        query = select(ResponseActionRecord)
+        count_query = select(func.count()).select_from(ResponseActionRecord)
+        if conditions:
+            query = query.where(and_(*conditions))
+            count_query = count_query.where(and_(*conditions))
+        total = int(await self.session.scalar(count_query) or 0)
+        rows = await self.session.execute(
+            query.order_by(ResponseActionRecord.decided_at.desc(), ResponseActionRecord.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return Page(list(rows.scalars()), total, limit, offset)
+
+
+class BlockRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def record_block(
+        self,
+        network: str,
+        *,
+        reason: str,
+        expires_at: datetime | None,
+        rate_limited: bool,
+        backend: str,
+    ) -> BlockRecord:
+        await self.deactivate(network, removal_reason="superseded by new block")
+        record = BlockRecord(
+            network=network,
+            reason=reason,
+            expires_at=expires_at,
+            rate_limited=rate_limited,
+            backend=backend,
+            active=True,
+        )
+        self.session.add(record)
+        return record
+
+    async def deactivate(self, network: str, *, removal_reason: str) -> int:
+        result = await self.session.execute(
+            update(BlockRecord)
+            .where(BlockRecord.network == network, BlockRecord.active.is_(True))
+            .values(active=False, removed_at=datetime.now(UTC), removal_reason=removal_reason)
+        )
+        return int(getattr(result, "rowcount", 0) or 0)
+
+    async def active(self) -> list[BlockRecord]:
+        rows = await self.session.execute(
+            select(BlockRecord)
+            .where(BlockRecord.active.is_(True))
+            .order_by(BlockRecord.created_at.desc())
+        )
+        return list(rows.scalars())
+
+    async def history(self, *, limit: int = 100, offset: int = 0) -> Page[BlockRecord]:
+        limit, offset = _clamp(limit, offset)
+        total = int(await self.session.scalar(select(func.count()).select_from(BlockRecord)) or 0)
+        rows = await self.session.execute(
+            select(BlockRecord)
+            .order_by(BlockRecord.created_at.desc(), BlockRecord.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return Page(list(rows.scalars()), total, limit, offset)
+
+
+# ===================================================================== audit
+
+
+class AuditRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def add(self, record: AuditEvent) -> AuditEvent:
+        self.session.add(record)
+        await self.session.flush()
+        return record
+
+    async def page(
+        self,
+        *,
+        actor: str | None = None,
+        action: str | None = None,
+        target: str | None = None,
+        since: datetime | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Page[AuditEvent]:
+        limit, offset = _clamp(limit, offset)
+        conditions: list[ColumnElement[bool]] = []
+        if actor:
+            conditions.append(AuditEvent.actor == actor)
+        if action:
+            conditions.append(AuditEvent.action == action.upper())
+        if target:
+            conditions.append(AuditEvent.target == target)
+        if since:
+            conditions.append(AuditEvent.timestamp >= since)
+        query = select(AuditEvent)
+        count_query = select(func.count()).select_from(AuditEvent)
+        if conditions:
+            query = query.where(and_(*conditions))
+            count_query = count_query.where(and_(*conditions))
+        total = int(await self.session.scalar(count_query) or 0)
+        rows = await self.session.execute(
+            query.order_by(AuditEvent.timestamp.desc(), AuditEvent.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return Page(list(rows.scalars()), total, limit, offset)
+
+
+# =============================================================== configuration
+
+
+class RuleRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def get(self, rule_id: str) -> RuleRecord | None:
+        return await self.session.get(RuleRecord, rule_id)
+
+    async def all(self) -> list[RuleRecord]:
+        return list(
+            (await self.session.execute(select(RuleRecord).order_by(RuleRecord.name))).scalars()
+        )
+
+    async def upsert(self, rule_id: str, **values: Any) -> RuleRecord:
+        record = await self.get(rule_id)
+        if record is None:
+            record = RuleRecord(rule_id=rule_id, **values)
+            self.session.add(record)
+        else:
+            for key, value in values.items():
+                setattr(record, key, value)
+        await self.session.flush()
+        return record
+
+    async def delete(self, rule_id: str) -> bool:
+        result = await self.session.execute(delete(RuleRecord).where(RuleRecord.rule_id == rule_id))
+        return bool(getattr(result, "rowcount", 0))
+
+
+class SettingRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def all(self) -> dict[str, dict[str, Any]]:
+        rows = await self.session.execute(select(SettingRecord))
+        return {row.key: row.value for row in rows.scalars()}
+
+    async def set(self, key: str, value: dict[str, Any], actor: str) -> None:
+        record = await self.session.get(SettingRecord, key)
+        if record is None:
+            self.session.add(SettingRecord(key=key, value=value, updated_by=actor))
+        else:
+            record.value = value
+            record.updated_by = actor
+
+
+class ReplayRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def add(self, record: ReplayRecord) -> None:
+        self.session.add(record)
+        await self.session.flush()
+
+    async def get(self, replay_id: str) -> ReplayRecord | None:
+        return await self.session.get(ReplayRecord, replay_id)
+
+    async def recent(self, *, limit: int = 50) -> list[ReplayRecord]:
+        limit, _ = _clamp(limit, 0)
+        rows = await self.session.execute(
+            select(ReplayRecord).order_by(ReplayRecord.created_at.desc()).limit(limit)
+        )
+        return list(rows.scalars())
+
+
+# ================================================================= telemetry
+
+
+class TelemetryRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def add_summary(self, record: TrafficSummary) -> None:
+        self.session.add(record)
+
+    async def add_metric(self, record: SystemMetric) -> None:
+        self.session.add(record)
+
+    async def summaries(
+        self, since: datetime, *, sensor: str | None = None
+    ) -> list[TrafficSummary]:
+        query = select(TrafficSummary).where(TrafficSummary.bucket_start >= since)
+        if sensor:
+            query = query.where(TrafficSummary.sensor == sensor)
+        rows = await self.session.execute(query.order_by(TrafficSummary.bucket_start).limit(20_000))
+        return list(rows.scalars())
+
+    async def metrics(self, since: datetime) -> list[SystemMetric]:
+        rows = await self.session.execute(
+            select(SystemMetric)
+            .where(SystemMetric.timestamp >= since)
+            .order_by(SystemMetric.timestamp)
+            .limit(20_000)
+        )
+        return list(rows.scalars())
+
+
+class AnalyticsRepository:
+    """Aggregations for the Overview and Analytics pages."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def _grouped(
+        self, column: Any, since: datetime, *, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        rows = await self.session.execute(
+            select(column, func.count())
+            .where(DetectionRecord.timestamp >= since, DetectionRecord.replay_id.is_(None))
+            .group_by(column)
+            .order_by(func.count().desc())
+            .limit(limit)
+        )
+        return [{"key": key, "count": int(count)} for key, count in rows.all()]
+
+    async def summary(self, since: datetime) -> dict[str, Any]:
+        live = and_(DetectionRecord.timestamp >= since, DetectionRecord.replay_id.is_(None))
+        total = int(
+            await self.session.scalar(select(func.count()).select_from(DetectionRecord).where(live))
+            or 0
+        )
+        false_positives = int(
+            await self.session.scalar(
+                select(func.count())
+                .select_from(DetectionRecord)
+                .where(live, DetectionRecord.status == "false_positive")
+            )
+            or 0
+        )
+        reviewed = int(
+            await self.session.scalar(
+                select(func.count())
+                .select_from(DetectionRecord)
+                .where(live, DetectionRecord.status != "new")
+            )
+            or 0
+        )
+        mean_risk = await self.session.scalar(
+            select(func.avg(DetectionRecord.risk_score)).where(live)
+        )
+        return {
+            "since": since.isoformat(),
+            "detections": total,
+            "by_severity": await self._grouped(DetectionRecord.severity, since),
+            "by_category": await self._grouped(DetectionRecord.category, since),
+            "by_detector": await self._grouped(DetectionRecord.detector, since),
+            "top_sources": await self._grouped(DetectionRecord.source_ip, since, limit=10),
+            "top_destinations": await self._grouped(
+                DetectionRecord.destination_ip, since, limit=10
+            ),
+            "by_protocol": await self._grouped(DetectionRecord.protocol, since),
+            "false_positives": false_positives,
+            "reviewed": reviewed,
+            # Only reviewed detections have a known verdict; dividing by all of them
+            # would report unreviewed alerts as true positives.
+            "false_positive_rate": round(false_positives / reviewed, 4) if reviewed else None,
+            "mean_risk": round(float(mean_risk), 1) if mean_risk is not None else None,
+        }
+
+    async def timeline(
+        self, since: datetime, bucket_minutes: int, dialect: str
+    ) -> list[dict[str, Any]]:
+        """Detection counts per time bucket, split by severity."""
+        bucket_seconds = max(60, bucket_minutes * 60)
+        if dialect == "postgresql":
+            epoch = func.extract("epoch", DetectionRecord.timestamp)
+            bucket = func.floor(epoch / bucket_seconds) * bucket_seconds
+            rows = await self.session.execute(
+                select(bucket.label("bucket"), DetectionRecord.severity, func.count())
+                .where(DetectionRecord.timestamp >= since, DetectionRecord.replay_id.is_(None))
+                .group_by("bucket", DetectionRecord.severity)
+            )
+            raw = [(float(b), sev, int(c)) for b, sev, c in rows.all()]
+        else:
+            rows = await self.session.execute(
+                select(DetectionRecord.timestamp, DetectionRecord.severity)
+                .where(DetectionRecord.timestamp >= since, DetectionRecord.replay_id.is_(None))
+                .limit(200_000)
+            )
+            raw = []
+            for timestamp, severity in rows.all():
+                moment = timestamp if timestamp.tzinfo else timestamp.replace(tzinfo=UTC)
+                raw.append(
+                    (float(int(moment.timestamp() // bucket_seconds) * bucket_seconds), severity, 1)
+                )
+
+        # A complete, zero-filled series: an interval with no detections is a real
+        # observation ("nothing happened"), and omitting it makes one busy interval
+        # render as if it spanned the whole period.
+        first = int(since.timestamp() // bucket_seconds) * bucket_seconds
+        last = int(datetime.now(UTC).timestamp() // bucket_seconds) * bucket_seconds
+        buckets: dict[float, dict[str, Any]] = {
+            float(start): {
+                "bucket_start": datetime.fromtimestamp(start, UTC).isoformat(),
+                "total": 0,
+            }
+            for start in range(first, last + 1, bucket_seconds)
+        }
+        for start, severity, count in raw:
+            entry = buckets.setdefault(
+                start, {"bucket_start": datetime.fromtimestamp(start, UTC).isoformat(), "total": 0}
+            )
+            entry[severity] = entry.get(severity, 0) + count
+            entry["total"] += count
+        return [buckets[key] for key in sorted(buckets)]
+
+
+class RetentionRepository:
+    """Deletes data past its retention period."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def purge(
+        self, *, retention_days: int, audit_days: int, metrics_days: int
+    ) -> dict[str, int]:
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(days=retention_days)
+        metric_cutoff = now - timedelta(days=metrics_days)
+        audit_cutoff = now - timedelta(days=audit_days)
+        results: dict[str, int] = {}
+
+        async def run(name: str, statement: Any) -> None:
+            result = await self.session.execute(statement)
+            results[name] = int(getattr(result, "rowcount", 0) or 0)
+
+        # Replay results carry the capture's own timestamps, which can be years old, so
+        # they expire with their replay (by when it ran), never by packet time. Live
+        # data expires by its timestamps.
+        expired_replays = select(ReplayRecord.replay_id).where(ReplayRecord.created_at < cutoff)
+        await run(
+            "detections",
+            delete(DetectionRecord).where(
+                or_(
+                    and_(DetectionRecord.replay_id.is_(None), DetectionRecord.timestamp < cutoff),
+                    DetectionRecord.replay_id.in_(expired_replays),
+                )
+            ),
+        )
+        # Closed live incidents, and every incident of an expired replay (replay
+        # incidents are never triaged). An open live incident is current work
+        # regardless of age.
+        await run(
+            "incidents",
+            delete(IncidentRecord).where(
+                or_(
+                    and_(
+                        IncidentRecord.replay_id.is_(None),
+                        IncidentRecord.last_seen < cutoff,
+                        IncidentRecord.status.in_(["resolved", "false_positive"]),
+                    ),
+                    IncidentRecord.replay_id.in_(expired_replays),
+                )
+            ),
+        )
+        await run(
+            "response_actions",
+            delete(ResponseActionRecord).where(
+                or_(
+                    and_(
+                        ResponseActionRecord.replay_id.is_(None),
+                        ResponseActionRecord.decided_at < cutoff,
+                    ),
+                    ResponseActionRecord.replay_id.in_(expired_replays),
+                )
+            ),
+        )
+        await run(
+            "blocked_sources",
+            delete(BlockRecord).where(
+                BlockRecord.active.is_(False), BlockRecord.created_at < cutoff
+            ),
+        )
+        await run(
+            "traffic_summaries",
+            delete(TrafficSummary).where(TrafficSummary.bucket_start < metric_cutoff),
+        )
+        await run(
+            "system_metrics", delete(SystemMetric).where(SystemMetric.timestamp < metric_cutoff)
+        )
+        await run("audit_events", delete(AuditEvent).where(AuditEvent.timestamp < audit_cutoff))
+        await run("replays", delete(ReplayRecord).where(ReplayRecord.created_at < cutoff))
+        # Revoked tokens are kept until they expire: presenting a revoked token is how
+        # reuse (theft) is detected, which only works while the record still exists.
+        await run("refresh_tokens", delete(RefreshToken).where(RefreshToken.expires_at < now))
+        return results
